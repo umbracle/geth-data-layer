@@ -184,11 +184,15 @@ func (b *Body) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
 	if err != nil {
 		return err
 	}
-	for _, txn := range txns {
+	for indx, txn := range txns {
 		bTxn := &Transaction{}
 		if err := bTxn.UnmarshalRLPFrom(p, txn); err != nil {
 			return err
 		}
+
+		fmt.Println("-- ", indx)
+		fmt.Println(hex.EncodeToString(p.Raw(txn)))
+
 		b.Transactions = append(b.Transactions, bTxn)
 	}
 
@@ -208,53 +212,148 @@ func (b *Body) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
 	return nil
 }
 
+type TransactionType int
+
+const (
+	TransactionLegacy TransactionType = 0
+	// eip-2930
+	TransactionAccessList TransactionType = 1
+	// eip-1559
+	TransactionDynamicFee TransactionType = 2
+)
+
 type Transaction struct {
+	Type TransactionType
+
+	// legacy values
 	Hash     hash
-	Nonce    uint64
-	GasPrice *big.Int
-	Gas      uint64
+	From     address
 	To       *address
-	Value    *big.Int
 	Input    []byte
-	V        byte
+	GasPrice uint64
+	Gas      uint64
+	Value    *big.Int
+	Nonce    uint64
+	V        []byte
 	R        []byte
 	S        []byte
+
+	// eip-2930 values
+	ChainID    *big.Int
+	AccessList AccessList
+
+	// eip-1559 values
+	MaxPriorityFeePerGas *big.Int
+	MaxFeePerGas         *big.Int
 }
 
-func (t *Transaction) UnmarshalRLP(input []byte) error {
-	return unmarshalRlp(t.UnmarshalRLPFrom, input)
+type AccessEntry struct {
+	Address address
+	Storage []hash
 }
 
-// UnmarshalRLP unmarshals a Transaction in RLP format
+type AccessList []AccessEntry
+
+func (t *Transaction) UnmarshalRLP(buf []byte) error {
+	return unmarshalRlp(t.UnmarshalRLPFrom, buf)
+}
+
 func (t *Transaction) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
+	keccak := fastrlp.NewKeccak256()
+
+	if v.Type() == fastrlp.TypeBytes {
+		// typed transaction
+		buf, err := v.Bytes()
+		if err != nil {
+			return err
+		}
+
+		switch typ := buf[0]; typ {
+		case 1:
+			t.Type = TransactionAccessList
+		case 2:
+			t.Type = TransactionDynamicFee
+		default:
+			return fmt.Errorf("type byte %d not found", typ)
+		}
+		buf = buf[1:]
+
+		pp := fastrlp.Parser{}
+		if v, err = pp.Parse(buf); err != nil {
+			return err
+		}
+
+		keccak.Write([]byte{byte(t.Type)})
+		keccak.Write(pp.Raw(v))
+	} else {
+		keccak.Write(p.Raw(v))
+	}
+
+	keccak.Sum(t.Hash[:0])
+
 	elems, err := v.GetElems()
 	if err != nil {
 		return err
 	}
-	if num := len(elems); num != 9 {
-		return fmt.Errorf("not enough elements to decode transaction, expected 9 but found %d", num)
+
+	getElem := func() *fastrlp.Value {
+		v := elems[0]
+		elems = elems[1:]
+		return v
 	}
 
-	p.Hash(t.Hash[:0], v)
+	var num int
+	switch t.Type {
+	case TransactionLegacy:
+		num = 9
+	case TransactionAccessList:
+		// legacy + chain id + access list
+		num = 11
+	case TransactionDynamicFee:
+		// access list txn + gas fee 1 + gas fee 2 - gas price
+		num = 12
+	default:
+		return fmt.Errorf("transaction type %d not found", t.Type)
+	}
+	if numElems := len(elems); numElems != num {
+		return fmt.Errorf("not enough elements to decode transaction, expected %d but found %d", num, numElems)
+	}
+
+	if t.Type != 0 {
+		t.ChainID = new(big.Int)
+		if err := getElem().GetBigInt(t.ChainID); err != nil {
+			return err
+		}
+	}
 
 	// nonce
-	if t.Nonce, err = elems[0].GetUint64(); err != nil {
+	if t.Nonce, err = getElem().GetUint64(); err != nil {
 		return err
 	}
-	// gasPrice
-	t.GasPrice = new(big.Int)
-	if err := elems[1].GetBigInt(t.GasPrice); err != nil {
-		return err
+
+	if t.Type == TransactionDynamicFee {
+		// dynamic fee uses
+		t.MaxPriorityFeePerGas = new(big.Int)
+		if err := getElem().GetBigInt(t.MaxPriorityFeePerGas); err != nil {
+			return err
+		}
+		t.MaxFeePerGas = new(big.Int)
+		if err := getElem().GetBigInt(t.MaxFeePerGas); err != nil {
+			return err
+		}
+	} else {
+		// legacy and access type use gas price
+		if t.GasPrice, err = getElem().GetUint64(); err != nil {
+			return err
+		}
 	}
+
 	// gas
-	if t.Gas, err = elems[2].GetUint64(); err != nil {
+	if t.Gas, err = getElem().GetUint64(); err != nil {
 		return err
 	}
 	// to
-	vv, err := v.Get(3).Bytes()
-	if err != nil {
-		return err
-	}
+	vv, _ := getElem().Bytes()
 	if len(vv) == 20 {
 		// address
 		var addr address
@@ -266,30 +365,78 @@ func (t *Transaction) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) erro
 	}
 	// value
 	t.Value = new(big.Int)
-	if err := elems[4].GetBigInt(t.Value); err != nil {
+	if err := getElem().GetBigInt(t.Value); err != nil {
 		return err
 	}
 	// input
-	if t.Input, err = elems[5].GetBytes(t.Input[:0]); err != nil {
+	if t.Input, err = getElem().GetBytes(t.Input[:0]); err != nil {
 		return err
 	}
-	// v
-	vv, err = v.Get(6).Bytes()
-	if err != nil {
-		return err
+
+	if t.Type != 0 {
+		if err := t.AccessList.UnmarshalRLPWith(getElem()); err != nil {
+			return err
+		}
 	}
-	if len(vv) != 1 {
-		t.V = 0x0
-	} else {
-		t.V = byte(vv[0])
+
+	// V
+	if t.V, err = getElem().GetBytes(t.V); err != nil {
+		return err
 	}
 	// R
-	if t.R, err = elems[7].GetBytes(t.R[:0]); err != nil {
+	if t.R, err = getElem().GetBytes(t.R); err != nil {
 		return err
 	}
 	// S
-	if t.S, err = elems[8].GetBytes(t.S[:0]); err != nil {
+	if t.S, err = getElem().GetBytes(t.S); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (a *AccessList) UnmarshalRLPWith(v *fastrlp.Value) error {
+	if v.Type() == fastrlp.TypeArrayNull {
+		// empty
+		return nil
+	}
+
+	elems, err := v.GetElems()
+	if err != nil {
+		return err
+	}
+	for _, elem := range elems {
+		entry := AccessEntry{}
+
+		acctElems, err := elem.GetElems()
+		if err != nil {
+			return err
+		}
+		if len(acctElems) != 2 {
+			return fmt.Errorf("two elems expected but %d found", len(acctElems))
+		}
+
+		// decode 'address'
+		if err = acctElems[0].GetAddr(entry.Address[:]); err != nil {
+			return err
+		}
+
+		// decode 'storage'
+		if acctElems[1].Type() != fastrlp.TypeArrayNull {
+			storageElems, err := acctElems[1].GetElems()
+			if err != nil {
+				return err
+			}
+
+			entry.Storage = make([]hash, len(storageElems))
+			for indx, storage := range storageElems {
+				// decode storage
+				if err = storage.GetHash(entry.Storage[indx][:]); err != nil {
+					return err
+				}
+			}
+		}
+		(*a) = append((*a), entry)
 	}
 	return nil
 }
@@ -311,6 +458,7 @@ type Header struct {
 	ExtraData    []byte
 	MixHash      hash
 	Nonce        [8]byte
+	BaseFee      *big.Int
 }
 
 func (h *Header) UnmarshalRLP(input []byte) error {
@@ -322,8 +470,9 @@ func (h *Header) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
 	if err != nil {
 		return err
 	}
-	if num := len(elems); num != 15 {
-		return fmt.Errorf("not enough elements to decode header, expected 15 but found %d", num)
+	num := len(elems)
+	if num != 15 && num != 16 {
+		return fmt.Errorf("not enough elements to decode header, expected 15 or 16 but found %d", num)
 	}
 
 	p.Hash(h.Hash[:0], v)
@@ -390,6 +539,14 @@ func (h *Header) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
 		return err
 	}
 	binary.BigEndian.PutUint64(h.Nonce[:], nonce)
+
+	if num == 16 {
+		// base fee
+		h.BaseFee = new(big.Int)
+		if err := elems[15].GetBigInt(h.BaseFee); err != nil {
+			return err
+		}
+	}
 
 	return err
 }
