@@ -184,15 +184,11 @@ func (b *Body) UnmarshalRLPFrom(p *fastrlp.Parser, v *fastrlp.Value) error {
 	if err != nil {
 		return err
 	}
-	for indx, txn := range txns {
+	for _, txn := range txns {
 		bTxn := &Transaction{}
 		if err := bTxn.UnmarshalRLPFrom(p, txn); err != nil {
 			return err
 		}
-
-		fmt.Println("-- ", indx)
-		fmt.Println(hex.EncodeToString(p.Raw(txn)))
-
 		b.Transactions = append(b.Transactions, bTxn)
 	}
 
