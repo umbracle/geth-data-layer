@@ -31,6 +31,14 @@ func NewAncientStore(path string) (*ancientStore, error) {
 		return nil, err
 	}
 
+	// all the tables should have the same number of items
+	if headerTable.numItems != bodiesTable.numItems {
+		return nil, fmt.Errorf("header and bodies table do not have same num of items")
+	}
+	if headerTable.numItems != receiptsTable.numItems {
+		return nil, fmt.Errorf("header and receipts table do not have same num of items")
+	}
+
 	store := &ancientStore{
 		receipts: receiptsTable,
 		headers:  headerTable,
@@ -39,11 +47,15 @@ func NewAncientStore(path string) (*ancientStore, error) {
 	return store, nil
 }
 
-func (a *ancientStore) Iterator() Iterator {
+func (a *ancientStore) LastNum() uint64 {
+	return a.headers.numItems
+}
+
+func (a *ancientStore) Iterator(num int) Iterator {
 	iter := &ancientIterator{
-		rIter: a.receipts.Iter(0),
-		hIter: a.headers.Iter(0),
-		bIter: a.bodies.Iter(0),
+		rIter: a.receipts.Iter(num),
+		hIter: a.headers.Iter(num),
+		bIter: a.bodies.Iter(num),
 	}
 	return iter
 }
@@ -98,6 +110,9 @@ type ancientTable struct {
 
 	// data files
 	data map[uint16]*os.File
+
+	// number of items in the table
+	numItems uint64
 }
 
 func newAncientTable(path, name string) (*ancientTable, error) {
@@ -115,6 +130,13 @@ func newAncientTable(path, name string) (*ancientTable, error) {
 	if t.index, err = os.Open(t.getIndexName(t.compressed)); err != nil {
 		return nil, err
 	}
+
+	stat, err := t.index.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	t.numItems = uint64(stat.Size() / indexEntrySize)
 
 	// preopen all the data files
 	if err := t.openDataFiles(); err != nil {
