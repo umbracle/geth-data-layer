@@ -8,44 +8,43 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
-type levelDbStore struct {
+type LevelDbStore struct {
 	db *leveldb.DB
 }
 
-func NewLevelDBStore(path string) (*levelDbStore, error) {
+func NewLevelDBStore(path string) (*LevelDbStore, error) {
 	db, err := leveldb.OpenFile(path, &opt.Options{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to load leveldb: %v", err)
 	}
-	store := &levelDbStore{
+	store := &LevelDbStore{
 		db: db,
 	}
 	return store, nil
 }
 
-func (l *levelDbStore) Iterator(num int) Iterator {
-	firstNum := uint64(0)
-	if num >= 0 {
-		firstNum = uint64(num)
-	}
-
+func (l *LevelDbStore) Iterator() Iterator {
 	iter := &levelDbIterator{
-		db:  l.db,
-		num: firstNum,
+		db: l,
 	}
+	iter.Seek(0)
 	return iter
 }
 
 type levelDbIterator struct {
-	db    *leveldb.DB
+	db    *LevelDbStore
 	num   uint64
 	block *Block
 }
 
-func (l *levelDbIterator) decodeBlock(num uint64) (*Block, error) {
+type kvDb interface {
+	Get([]byte) ([]byte, error)
+}
+
+func decodeBlock(db kvDb, num uint64) (*Block, error) {
 	// find the canonical chain for 'num' to resolve
 	// the hash
-	hashB, err := l.db.Get(headerHashKey(l.num), nil)
+	hashB, err := db.Get(headerHashKey(num))
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +53,7 @@ func (l *levelDbIterator) decodeBlock(num uint64) (*Block, error) {
 	}
 
 	// header
-	headerRaw, err := l.db.Get(headerKey(l.num, hashB), nil)
+	headerRaw, err := db.Get(headerKey(num, hashB))
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +63,7 @@ func (l *levelDbIterator) decodeBlock(num uint64) (*Block, error) {
 	}
 
 	// body
-	bodyRaw, err := l.db.Get(blockBodyKey(num, hashB), nil)
+	bodyRaw, err := db.Get(blockBodyKey(num, hashB))
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +73,7 @@ func (l *levelDbIterator) decodeBlock(num uint64) (*Block, error) {
 	}
 
 	// receipts
-	receiptsRaw, err := l.db.Get(blockReceiptsKey(num, hashB), nil)
+	receiptsRaw, err := db.Get(blockReceiptsKey(num, hashB))
 	if err != nil {
 		return nil, err
 	}
@@ -96,8 +95,16 @@ func (l *levelDbIterator) decodeBlock(num uint64) (*Block, error) {
 	return resp, nil
 }
 
+func (l *LevelDbStore) Get(k []byte) ([]byte, error) {
+	return l.db.Get(k, nil)
+}
+
+func (l *levelDbIterator) Seek(num uint64) {
+	l.num = num
+}
+
 func (l *levelDbIterator) Next() bool {
-	block, err := l.decodeBlock(l.num)
+	block, err := decodeBlock(l.db, l.num)
 	if err != nil {
 		return false
 	}
@@ -124,6 +131,10 @@ var (
 
 	// headerPrefix + num (uint64 big endian) + headerHashSuffix -> hash
 	headerHashSuffix = []byte("n")
+
+	headBlockKey = []byte("LastBlock")
+
+	headerNumberPrefix = []byte("H") // headerNumberPrefix + hash -> num (uint64 big endian)
 )
 
 func marshalUint64(num uint64) []byte {
@@ -154,4 +165,8 @@ func blockReceiptsKey(number uint64, hash []byte) []byte {
 
 func headerHashKey(number uint64) []byte {
 	return append(append(headerPrefix, marshalUint64(number)...), headerHashSuffix...)
+}
+
+func headerNumberKey(hash []byte) []byte {
+	return append(headerNumberPrefix, hash...)
 }
