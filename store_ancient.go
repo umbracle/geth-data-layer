@@ -11,13 +11,13 @@ import (
 
 var _ Iterator = &ancientIterator{}
 
-type ancientStore struct {
+type AncientStore struct {
 	receipts *ancientTable
 	headers  *ancientTable
 	bodies   *ancientTable
 }
 
-func NewAncientStore(path string) (*ancientStore, error) {
+func NewAncientStore(path string) (*AncientStore, error) {
 	receiptsTable, err := newAncientTable(path, "receipts")
 	if err != nil {
 		return nil, err
@@ -39,7 +39,7 @@ func NewAncientStore(path string) (*ancientStore, error) {
 		return nil, fmt.Errorf("header and receipts table do not have same num of items")
 	}
 
-	store := &ancientStore{
+	store := &AncientStore{
 		receipts: receiptsTable,
 		headers:  headerTable,
 		bodies:   bodiesTable,
@@ -47,15 +47,15 @@ func NewAncientStore(path string) (*ancientStore, error) {
 	return store, nil
 }
 
-func (a *ancientStore) LastNum() uint64 {
+func (a *AncientStore) LastNum() uint64 {
 	return a.headers.numItems
 }
 
-func (a *ancientStore) Iterator(num int) Iterator {
+func (a *AncientStore) Iterator() Iterator {
 	iter := &ancientIterator{
-		rIter: a.receipts.Iter(num),
-		hIter: a.headers.Iter(num),
-		bIter: a.bodies.Iter(num),
+		rIter: a.receipts.Iter(),
+		hIter: a.headers.Iter(),
+		bIter: a.bodies.Iter(),
 	}
 	return iter
 }
@@ -64,6 +64,12 @@ type ancientIterator struct {
 	rIter *ancientTableIterator
 	hIter *ancientTableIterator
 	bIter *ancientTableIterator
+}
+
+func (i *ancientIterator) Seek(num uint64) {
+	i.rIter.Seek(num)
+	i.hIter.Seek(num)
+	i.bIter.Seek(num)
 }
 
 func (i *ancientIterator) Next() bool {
@@ -234,14 +240,12 @@ func (a *ancientTable) openDataFiles() error {
 	return nil
 }
 
-func (a *ancientTable) Iter(num int) *ancientTableIterator {
-	a.index.Seek(int64(num*int(indexEntrySize)), 0)
-
+func (a *ancientTable) Iter() *ancientTableIterator {
 	i := &ancientTableIterator{
 		table:     a,
 		indexFile: a.index,
 	}
-	i.ptr = i.readEntry()
+	i.Seek(0)
 	return i
 }
 
@@ -263,6 +267,11 @@ func (i *ancientTableIterator) readEntry() indexEntry {
 	entry.Unmarshal(buf)
 
 	return entry
+}
+
+func (i *ancientTableIterator) Seek(num uint64) {
+	i.indexFile.Seek(int64(num)*indexEntrySize, 0)
+	i.ptr = i.readEntry()
 }
 
 func (i *ancientTableIterator) Next() bool {
